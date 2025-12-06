@@ -17,7 +17,7 @@ class Userbot(Client):
         Each client is assigned a unique name based on the key in the `clients` dictionary.
         """
         self.clients = []
-        clients = {"one": "SESSION1", "two": "SESSION2", "three": "SESSION3"}
+        clients = {"one": "SESSION1", "two": "SESSION2", "three": "SESSION3", "four": "SESSION4"}
         for key, string_key in clients.items():
             name = f"AnonyUB{key[-1]}"
             session = getattr(config, string_key)
@@ -45,6 +45,7 @@ class Userbot(Client):
             1: self.one,
             2: self.two,
             3: self.three,
+            4: self.four,
         }
         client = clients[num]
         await client.start()
@@ -59,7 +60,7 @@ class Userbot(Client):
         client.mention = ub.me.mention
         self.clients.append(client)
         try:
-            await ub.join_chat("FallenAssociation")
+            await ub.join_chat("arcupdates")
         except:
             pass
         logger.info(f"Assistant {num} started as @{client.username}")
@@ -74,6 +75,8 @@ class Userbot(Client):
             await self.boot_client(2, self.two)
         if config.SESSION3:
             await self.boot_client(3, self.three)
+        if config.SESSION4:
+            await self.boot_client(4, self.four)
 
     async def exit(self):
         """
@@ -85,4 +88,6 @@ class Userbot(Client):
             await self.two.stop()
         if config.SESSION3:
             await self.three.stop()
+        if config.SESSION4:
+            await self.four.stop()
         logger.info("Assistants stopped.")
