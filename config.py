@@ -21,6 +21,7 @@ class Config:
         self.SESSION1 = getenv("SESSION", None)
         self.SESSION2 = getenv("SESSION2", None)
         self.SESSION3 = getenv("SESSION3", None)
+        self.SESSION4 = getenv("SESSION4", None)
 
         self.API_KEY = getenv("API_KEY")
         self.API_URL = getenv("API_URL")
