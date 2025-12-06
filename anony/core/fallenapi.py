@@ -24,7 +24,7 @@ _session_lock = asyncio.Lock()
 CHUNK_SIZE = 1 << 20
 
 # 11-char YouTube ID regex (same logic as downloader.py) :contentReference[oaicite:0]{index=0}
-YOUTUBE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$)
+YOUTUBE_ID_RE = re.compile(r^[a-zA-Z0-9_-]{11}$)
 
 
 async def get_http_session() -> aiohttp.ClientSession:
