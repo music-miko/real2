@@ -18,11 +18,18 @@ async def _help(_, m: types.Message):
         quote=True,
     )
 
-
 @app.on_message(filters.command(["start"]))
 @lang.language()
 async def start(_, message: types.Message):
-    if message.from_user.id in app.bl_users and message.from_user.id not in db.notified:
+    user = message.from_user
+
+    # If from_user is None (channel post / anon admin / etc), just ignore
+    if user is None:
+        # optional: log it if you want to debug
+        # logger.warning(f"/start with no from_user: chat_id={message.chat.id}, message_id={message.id}")
+        return
+
+    if user.id in app.bl_users and user.id not in db.notified:
         return await message.reply_text(message.lang["bl_user_notify"])
 
     if len(message.command) > 1 and message.command[1] == "help":
@@ -30,7 +37,7 @@ async def start(_, message: types.Message):
 
     private = message.chat.type == enums.ChatType.PRIVATE
     _text = (
-        message.lang["start_pm"].format(message.from_user.first_name, app.name)
+        message.lang["start_pm"].format(user.first_name, app.name)
         if private
         else message.lang["start_gp"].format(app.name)
     )
@@ -44,11 +51,10 @@ async def start(_, message: types.Message):
     )
 
     if private:
-        if await db.is_user(message.from_user.id):
+        if await db.is_user(user.id):
             return
         await utils.send_log(message)
-        return await db.add_user(message.from_user.id)
-
+        return await db.add_user(user.id)
 
 @app.on_message(filters.command(["playmode", "settings"]) & filters.group & ~app.bl_users)
 @lang.language()
