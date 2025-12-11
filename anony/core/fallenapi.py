@@ -10,29 +10,9 @@ from typing import Dict, Optional, Any, Union
 
 import aiohttp
 from pydantic import BaseModel
-
-# project imports (fall back to minimal stubs when running standalone)
-try:
-    from anony import logger, app
-    from config import Config
-except Exception:
-    import logging as _logging
-    logger = getattr(_logging, "getLogger")("fallenapi")
-    logger.setLevel(_logging.DEBUG)
-    if not logger.handlers:
-        logger.addHandler(_logging.StreamHandler())
-
-    class _Cfg:
-        API_URL = os.environ.get("API_URL", "")
-        API_KEY = os.environ.get("API_KEY", "")
-    config = _Cfg()
-    app = None
-
-try:
-    from pyrogram import errors as pyrogram_errors
-except Exception:
-    class _PE: pass
-    pyrogram_errors = _PE()
+from anony import logger, app
+from config import Config
+from pyrogram import errors as pyrogram_errors
 
 # regex for extracting a YouTube video id
 _YT_ID_RE = re.compile(
