@@ -14,7 +14,7 @@ from pydantic import BaseModel
 # project imports (fall back to minimal stubs when running standalone)
 try:
     from anony import logger, app
-    import config
+    from config import Config
 except Exception:
     import logging as _logging
     logger = getattr(_logging, "getLogger")("fallenapi")
