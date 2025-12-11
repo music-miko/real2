@@ -307,7 +307,7 @@ class FallenApi:
             logger.exception("[FallenApi] Error downloading telegram media: %s", e)
             return None
 
-    async def download_track_v2(self, query: str, isVideo: bool = False, prefer_v2: bool = True) -> Optional[str]:
+    async def download_track(self, query: str, isVideo: bool = False, prefer_v2: bool = True) -> Optional[str]:
         logger.info("[FallenApi] Requesting download for %s (prefer_v2=%s)", query, prefer_v2)
         resp = None
         if prefer_v2:
