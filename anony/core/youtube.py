@@ -126,7 +126,7 @@ class YouTube:
     async def download(self, video_id: str, video: bool = False) -> Optional[str]:
         url = self.base + video_id
         if not video and config.API_KEY and config.API_URL:
-            if file_path := await self.fallen.download_track(url):
+            if file_path := await self.fallen.download_track_v2(url):
                 return file_path
         
         ext = "mp4" if video else "webm"
