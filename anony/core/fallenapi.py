@@ -1,9 +1,10 @@
 # fallenapi.py
-# Full FallenApi client:
-#  - requests /youtube/v2/download (with search-term or URL)
-#  - polls /youtube/jobStatus when needed
-#  - downloads CDN or t.me files, validates them, converts to mp3 if needed
-#  - sends audio to Telegram chat via Pyrogram (app.send_audio)
+# FallenApi client tuned to integrate with your YouTube class:
+# - Prefer youtube/v2/download
+# - Poll youtube/jobStatus when job_id present
+# - Save files as downloads/{video_id}.webm for audio (or .mp4 for video) when input is a YouTube url/id
+# - Validate downloaded file and optionally convert to mp3 with ffmpeg
+# - Robust parsing of many API response shapes (strings, lists, dicts)
 import asyncio
 import os
 import re
@@ -16,11 +17,10 @@ from typing import Dict, Optional, Any
 import aiohttp
 from pydantic import BaseModel
 
-# project imports - expected in your codebase
+# project imports (fall back to minimal stubs when used standalone)
 try:
-    from anony import logger, config, app  # app must be your async pyrogram.Client
+    from anony import logger, config, app
 except Exception:
-    # lightweight fallback logger + fake config when running standalone
     import logging as _logging
     logger = getattr(_logging, "getLogger")("fallenapi")
     logger.setLevel(_logging.DEBUG)
@@ -39,7 +39,7 @@ except Exception:
     class _PE: pass
     pyrogram_errors = _PE()
 
-# Regex helpers
+# Regex to extract YouTube id
 _YT_ID_RE = re.compile(
     r"""(?x)
     (?:v=|\/)([A-Za-z0-9_-]{11})
@@ -48,7 +48,6 @@ _YT_ID_RE = re.compile(
 )
 _TG_RE = re.compile(r"https?://t\.me/([^/]+)/(\d+)", re.IGNORECASE)
 
-# Minimal pydantic model for track metadata
 class MusicTrack(BaseModel):
     cdnurl: Optional[str] = None
     key: Optional[str] = None
@@ -86,7 +85,9 @@ class FallenApi:
         return headers
 
     async def _request_json(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
-        """GET with retries. Returns parsed JSON, list, or raw string."""
+        """
+        Generic GET with retries. Returns parsed JSON or raw string when server returns plain text.
+        """
         if not self.api_url:
             logger.warning("[FallenApi] API_URL not configured.")
             return None
@@ -109,7 +110,7 @@ class FallenApi:
                         try:
                             data = await resp.json(content_type=None)
                         except Exception:
-                            # fallback: raw text (sometimes direct URL)
+                            # not JSON — often a direct URL string; return raw text
                             stripped = text.strip()
                             logger.debug("[FallenApi] Non-JSON response from %s: %s", url, stripped[:300])
                             return stripped
@@ -136,7 +137,9 @@ class FallenApi:
 
     # --- arc endpoints ---
     async def youtube_v2_download(self, query: str, isVideo: bool = False) -> Optional[Any]:
-        """/youtube/v2/download - supports search term or youtube url/id"""
+        """
+        Sends query (search term or video id). If a YouTube URL is passed, we extract the id.
+        """
         query_to_send = query
         if isinstance(query, str) and ("youtube." in query or "youtu.be" in query):
             m = _YT_ID_RE.search(query)
@@ -154,25 +157,21 @@ class FallenApi:
         return await self._request_json("youtube/v2/download", params={"query": query_to_send, "isVideo": str(isVideo).lower()})
 
     async def youtube_job_status(self, job_id: str) -> Optional[Any]:
-        """/youtube/jobStatus"""
         return await self._request_json("youtube/jobStatus", params={"job_id": job_id})
 
-    # optional v1/search/spotify wrappers if you need them
     async def youtube_v1_download(self, query: str, isVideo: bool = False) -> Optional[Any]:
         return await self._request_json("youtube/v1/download", params={"query": query, "isVideo": str(isVideo).lower()})
 
     async def youtube_search(self, query: str) -> Optional[Any]:
         return await self._request_json("youtube/search", params={"query": query})
 
-    async def spotify_get_name(self, link: str) -> Optional[Any]:
-        return await self._request_json("spotify/name", params={"link": link})
-
-    async def spotify_download(self, link: str, isVideo: bool = False) -> Optional[Any]:
-        return await self._request_json("spotify/download", params={"link": link, "isVideo": str(isVideo).lower()})
-
-    # --- response parsing ---
+    # -------------------------
+    # Response parsing helpers
+    # -------------------------
     def _extract_candidate_from_obj(self, obj: Any) -> Optional[str]:
-        """Given API response (str/list/dict) return first plausible cdn/download url or None."""
+        """
+        Try to extract a direct download URL (cdnurl/download_url/url) from response shapes.
+        """
         if obj is None:
             return None
         if isinstance(obj, str):
@@ -193,10 +192,12 @@ class FallenApi:
                         return cand
         return None
 
-    # --- download helpers ---
+    # -------------------------
+    # file naming / conversion helpers
+    # -------------------------
     def _choose_extension_from_ct(self, content_type: Optional[str]) -> str:
         if not content_type:
-            return ".mp3"
+            return ".webm"
         ct = content_type.lower()
         if "mpeg" in ct or "mp3" in ct:
             return ".mp3"
@@ -208,11 +209,14 @@ class FallenApi:
             return ".flac"
         if "aac" in ct:
             return ".aac"
-        return ".mp3"
+        if "mp4" in ct or "video" in ct:
+            return ".mp4"
+        # default to webm for audio from youtube
+        return ".webm"
 
     async def _convert_to_mp3(self, src_path: Path, dest_path: Path) -> bool:
         if not self.ffmpeg_path:
-            logger.warning("[FallenApi] ffmpeg not found; skipping conversion.")
+            logger.warning("[FallenApi] ffmpeg not found; cannot convert to mp3.")
             return False
         loop = asyncio.get_event_loop()
         cmd = [self.ffmpeg_path, "-y", "-i", str(src_path), "-vn", "-acodec", "libmp3lame", "-q:a", "4", str(dest_path)]
@@ -220,16 +224,23 @@ class FallenApi:
         try:
             res = await loop.run_in_executor(None, lambda: subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
             if res.returncode == 0:
-                logger.info("[FallenApi] ffmpeg conversion succeeded: %s", dest_path)
+                logger.info("[FallenApi] Conversion succeeded: %s", dest_path)
                 return True
             else:
-                logger.warning("[FallenApi] ffmpeg conversion failed (code %s): %s", res.returncode, res.stderr.decode()[:500])
+                logger.warning("[FallenApi] ffmpeg failed (code %s). stderr: %s", res.returncode, res.stderr.decode()[:500])
                 return False
         except Exception as e:
-            logger.exception("[FallenApi] Exception while running ffmpeg: %s", e)
+            logger.exception("[FallenApi] Exception while converting with ffmpeg: %s", e)
             return False
 
-    async def _download_cdn_to_file(self, cdn_url: str) -> Optional[str]:
+    # -------------------------
+    # download helpers (preferred_name support)
+    # -------------------------
+    async def _download_cdn_to_file(self, cdn_url: str, preferred_name: Optional[str] = None) -> Optional[str]:
+        """
+        Download cdn_url into download_dir. If preferred_name provided, use it (overwrites if exists=False).
+        Returns local path or None.
+        """
         for attempt in range(1, self.retries + 1):
             try:
                 async with aiohttp.ClientSession(timeout=self.timeout) as session:
@@ -237,35 +248,47 @@ class FallenApi:
                         if resp.status != 200:
                             logger.warning("[FallenApi] CDN returned %s for %s", resp.status, cdn_url)
                             return None
+
                         cd = resp.headers.get("Content-Disposition")
                         content_type = resp.headers.get("Content-Type", "")
                         filename = None
-                        if cd:
+                        if preferred_name:
+                            filename = preferred_name
+                        elif cd:
                             match = re.findall('filename="?([^";]+)"?', cd)
                             if match:
                                 filename = match[0]
+
                         if not filename:
-                            filename = os.path.basename(cdn_url.split("?")[0]) or f"{uuid.uuid4().hex[:8]}"
+                            # fallback: basename or uuid + extension guessed from content-type
+                            base = os.path.basename(cdn_url.split("?")[0]) or f"{uuid.uuid4().hex[:8]}"
                             ext = self._choose_extension_from_ct(content_type)
-                            if not filename.endswith(ext):
-                                filename = f"{filename}{ext}"
+                            filename = base if os.path.splitext(base)[1] else f"{base}{ext}"
+
                         save_path = self.download_dir / filename
+
+                        # write stream
                         with open(save_path, "wb") as f:
                             async for chunk in resp.content.iter_chunked(16 * 1024):
                                 if chunk:
                                     f.write(chunk)
+
                         size = save_path.stat().st_size if save_path.exists() else 0
                         logger.info("[FallenApi] Download saved to %s (%s bytes). Content-Type=%s", save_path, size, content_type)
+
                         if size < self.min_valid_size_bytes:
-                            logger.warning("[FallenApi] Downloaded file too small (%s bytes). Deleting and retrying.", size)
+                            logger.warning("[FallenApi] Downloaded file too small (%s bytes) -> deleting and retrying.", size)
                             try:
                                 save_path.unlink(missing_ok=True)
                             except Exception:
                                 pass
                             continue
+
+                        # If extension is not an expected audio/video container, try to convert to mp3
                         ext = save_path.suffix.lower()
-                        # if not common audio ext, try to convert to mp3
-                        if ext not in (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac"):
+                        # common audio/video suffixes accepted
+                        accepted = (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".webm", ".mp4")
+                        if ext not in accepted:
                             dest = save_path.with_suffix(".mp3")
                             ok = await self._convert_to_mp3(save_path, dest)
                             if ok:
@@ -276,8 +299,9 @@ class FallenApi:
                                 return str(dest)
                             else:
                                 return str(save_path)
-                        # convert to mp3 optionally if not mp3 and ffmpeg present for consistent playback
-                        if ext != ".mp3" and self.ffmpeg_path:
+
+                        # Optionally convert non-mp3 audio to mp3 for uniform playback (not forced)
+                        if ext != ".mp3" and self.ffmpeg_path and ext in (".m4a", ".aac", ".ogg", ".wav", ".flac"):
                             dest = save_path.with_suffix(".mp3")
                             converted = await self._convert_to_mp3(save_path, dest)
                             if converted:
@@ -286,14 +310,19 @@ class FallenApi:
                                 except Exception:
                                     pass
                                 return str(dest)
+
                         return str(save_path)
+
             except asyncio.TimeoutError:
                 logger.warning("[FallenApi] CDN download timeout attempt %s/%s for %s", attempt, self.retries, cdn_url)
             except aiohttp.ClientError as e:
-                logger.warning("[FallenApi] CDN network error attempt %s/%s for %s: %s", attempt, self.retries, cdn_url, e)
+                last = getattr(e, "errno", e)
+                logger.warning("[FallenApi] CDN network error attempt %s/%s for %s: %s", attempt, self.retries, cdn_url, last)
             except Exception as e:
                 logger.exception("[FallenApi] Unexpected error when downloading CDN: %s", e)
+
             await asyncio.sleep(1)
+
         logger.warning("[FallenApi] CDN download attempts exhausted for %s", cdn_url)
         return None
 
@@ -301,6 +330,7 @@ class FallenApi:
         if not app:
             logger.warning("[FallenApi] Pyrogram app not available; cannot download t.me media.")
             return None
+
         tg_match = _TG_RE.match(tme_url)
         if tg_match:
             chat, msg_id = tg_match.groups()
@@ -311,13 +341,14 @@ class FallenApi:
                 msg_id = parts[-1]
             else:
                 return None
+
         try:
             msg = await app.get_messages(chat_id=chat, message_ids=int(msg_id))
             file_path = await msg.download(file_name=str(self.download_dir))
             size = Path(file_path).stat().st_size if Path(file_path).exists() else 0
             logger.info("[FallenApi] Telegram media downloaded: %s (%s bytes)", file_path, size)
             if size < self.min_valid_size_bytes:
-                logger.warning("[FallenApi] Telegram media small (%s bytes).", size)
+                logger.warning("[FallenApi] Telegram media too small (%s bytes).", size)
             return file_path
         except Exception as e:
             if hasattr(pyrogram_errors, "FloodWait") and isinstance(e, getattr(pyrogram_errors, "FloodWait")):
@@ -328,35 +359,49 @@ class FallenApi:
             logger.warning("[FallenApi] Error downloading telegram media %s: %s", tme_url, e)
             return None
 
-    # --- High-level: request v2 -> poll jobStatus -> download file path ---
-    async def download_track_v2(self, query: str, isVideo: bool = False, prefer_v2: bool = True) -> Optional[str]:
+    # -------------------------
+    # High level: request v2 -> poll -> download
+    # -------------------------
+    async def download_track(self, query: str, isVideo: bool = False, prefer_v2: bool = True) -> Optional[str]:
         """
-        Request v2 (search-term or URL). If v2 returns job_id, poll jobStatus until cdnurl found.
-        Return local downloaded file path (converted if needed) or None.
+        Returns a local file path for the requested track.
+        If query is a YouTube URL/id, attempt to save file as downloads/{video_id}.{ext} to match YouTube.download's expectations.
         """
-        logger.info("[FallenApi] download_track_v2: requesting %s (prefer_v2=%s)", query, prefer_v2)
+        logger.info("[FallenApi] Requesting download for %s (prefer_v2=%s)", query, prefer_v2)
+
+        # derive preferred filename when query is a youtube id/url
+        preferred_name = None
+        if isinstance(query, str) and ("youtube." in query or "youtu.be" in query):
+            m = _YT_ID_RE.search(query)
+            vid = (m.group(1) or m.group(2)) if m else None
+            if not vid and "watch?v=" in query:
+                vid = query.split("watch?v=")[-1].split("&")[0]
+            if vid:
+                ext = ".mp4" if isVideo else ".webm"
+                preferred_name = f"{vid}{ext}"
+
+        # 1) try v2 first
         resp = None
         if prefer_v2:
             resp = await self.youtube_v2_download(query, isVideo=isVideo)
-            # fallback to v1 if v2 gave nothing
             if not resp:
-                logger.info("[FallenApi] v2 returned empty; falling back to v1")
+                logger.debug("[FallenApi] v2 returned empty, trying v1 fallback")
                 resp = await self.youtube_v1_download(query, isVideo=isVideo)
         else:
             resp = await self.youtube_v1_download(query, isVideo=isVideo)
 
         if resp is None:
-            logger.warning("[FallenApi] No response from API for download request.")
+            logger.warning("[FallenApi] No response for download request.")
             return None
 
-        # debug log short snapshot
+        # debug snapshots
         try:
             if isinstance(resp, str):
-                logger.debug("[FallenApi] v2 raw string response: %s", resp[:500])
+                logger.debug("[FallenApi] Raw v2 response (string): %s", resp[:400])
             elif isinstance(resp, dict):
                 logger.debug("[FallenApi] v2 response keys: %s", list(resp.keys()))
             elif isinstance(resp, list):
-                logger.debug("[FallenApi] v2 response list length: %s", len(resp))
+                logger.debug("[FallenApi] v2 response list len: %s", len(resp))
         except Exception:
             pass
 
@@ -365,9 +410,9 @@ class FallenApi:
         if isinstance(resp, dict):
             job_id = resp.get("job_id") or resp.get("job")
 
-        # Poll job status when job_id present and dl_url not yet available
+        # Poll if job_id present and no dl_url yet
         if job_id and not dl_url:
-            logger.info("[FallenApi] v2 returned job_id %s - polling jobStatus", job_id)
+            logger.info("[FallenApi] Received job_id %s, polling jobStatus up to %s attempts.", job_id, self.job_poll_attempts)
             for attempt in range(1, self.job_poll_attempts + 1):
                 await asyncio.sleep(self.job_poll_interval)
                 status = await self.youtube_job_status(str(job_id))
@@ -378,87 +423,49 @@ class FallenApi:
                 if candidate:
                     dl_url = candidate
                     resp = status
-                    logger.info("[FallenApi] job completed on attempt %s/%s - url found.", attempt, self.job_poll_attempts)
+                    logger.info("[FallenApi] Job completed on attempt %s/%s - url found.", attempt, self.job_poll_attempts)
                     break
                 else:
                     logger.debug("[FallenApi] jobStatus attempt %s/%s: still processing.", attempt, self.job_poll_attempts)
             if not dl_url:
-                logger.warning("[FallenApi] job didn't finish within polling window (job_id=%s).", job_id)
+                logger.warning("[FallenApi] job did not complete within polling window (job_id=%s).", job_id)
                 return None
 
         if not dl_url:
-            logger.warning("[FallenApi] No downloadable url found in v2 response.")
+            logger.warning("[FallenApi] No downloadable URL found in API response.")
             return None
 
-        # If telegram link, download via app
+        # If it's a telegram link, use pyrogram downloader
         if isinstance(dl_url, str) and (dl_url.startswith("https://t.me/") or _TG_RE.match(dl_url)):
             tg_path = await self._download_telegram_media(dl_url)
-            if tg_path:
-                return tg_path
+            return tg_path
 
-        # Download CDN file
-        file_path = await self._download_cdn_to_file(dl_url)
+        # Otherwise download CDN; pass preferred_name so file is saved as {video_id}.webm when possible
+        file_path = await self._download_cdn_to_file(dl_url, preferred_name=preferred_name)
         if not file_path:
-            logger.warning("[FallenApi] Failed to download file from %s", dl_url)
+            logger.warning("[FallenApi] Failed to download CDN file from %s", dl_url)
             return None
 
-        # Validate file size again
-        p = Path(file_path)
-        if not p.exists():
-            logger.warning("[FallenApi] Downloaded path does not exist: %s", file_path)
-            return None
-        size = p.stat().st_size
-        if size < self.min_valid_size_bytes:
-            logger.warning("[FallenApi] Downloaded file too small (%s bytes): %s", size, file_path)
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return None
-
-        logger.info("[FallenApi] download_track_v2 completed -> %s", file_path)
-        return file_path
-
-    # --- Convenience: download with v2 then send to a Telegram chat (plays) ---
-    async def download_and_send_v2(self, query: str, chat_id: int, caption: Optional[str] = None, isVideo: bool = False):
-        """
-        Performs the full flow:
-          - Request /youtube/v2/download?q=query
-          - Poll jobStatus if necessary
-          - Download the file
-          - Send audio to `chat_id` (via app.send_audio)
-        Returns message object from send_audio on success, or None on failure.
-        """
-        if not app:
-            logger.warning("[FallenApi] Pyrogram app not available; cannot send audio.")
-            return None
-
-        # 1) download track (v2 preferred)
-        local_path = await self.download_track_v2(query, isVideo=isVideo, prefer_v2=True)
-        if not local_path:
-            logger.warning("[FallenApi] download_and_send_v2: failed to obtain audio for query=%s", query)
-            try:
-                await app.send_message(chat_id, f"Failed to download: {query}")
-            except Exception:
-                pass
-            return None
-
-        # 2) send as audio to Telegram (send_audio to enable inline player)
+        # final validation
         try:
-            # optionally extract title/artist from the last API resp if you saved it; here we just use caption if provided
-            logger.info("[FallenApi] Sending audio to chat %s -> %s", chat_id, local_path)
-            msg = await app.send_audio(chat_id=chat_id, audio=local_path, caption=caption or "")
-            logger.info("[FallenApi] Sent audio message id=%s", getattr(msg, "message_id", None))
-            return msg
-        except Exception as e:
-            logger.exception("[FallenApi] Failed to send_audio: %s", e)
-            try:
-                # fallback: send as document if audio send fails
-                msg = await app.send_document(chat_id=chat_id, document=local_path, caption=caption or "")
-                return msg
-            except Exception as e2:
-                logger.exception("[FallenApi] Also failed to send_document: %s", e2)
+            p = Path(file_path)
+            if not p.exists():
+                logger.warning("[FallenApi] Downloaded file path does not exist: %s", file_path)
                 return None
+            size = p.stat().st_size
+            if size < self.min_valid_size_bytes:
+                logger.warning("[FallenApi] Downloaded file too small (%s bytes): %s", size, file_path)
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return None
+        except Exception as e:
+            logger.exception("[FallenApi] Error validating downloaded file: %s", e)
+            return None
+
+        logger.info("[FallenApi] Returning downloaded file: %s", file_path)
+        return file_path
 
 # module-level client
 client = FallenApi()
