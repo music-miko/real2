@@ -10,8 +10,7 @@ from typing import Dict, Optional, Any, Union
 
 import aiohttp
 from pydantic import BaseModel
-from anony import logger, app
-from config import Config
+from anony import logger, app, config
 from pyrogram import errors as pyrogram_errors
 
 # regex for extracting a YouTube video id
@@ -43,8 +42,8 @@ class FallenApi:
         job_poll_attempts: int = 20,
         job_poll_interval: float = 2.0,
     ):
-        self.api_url = Config.API_URL.rstrip("/")
-        self.api_key = Config.API_KEY
+        self.api_url = config.API_URL.rstrip("/")
+        self.api_key = config.API_KEY
         self.retries = retries
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.download_dir = Path(download_dir)
