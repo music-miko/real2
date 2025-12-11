@@ -63,8 +63,8 @@ class FallenApi:
         job_poll_attempts: int = 20,
         job_poll_interval: float = 2.0,
     ):
-        self.api_url = (api_url or getattr(config, "API_URL", "") or "").rstrip("/")
-        self.api_key = api_key or getattr(config, "API_KEY", "") or ""
+        self.api_url = config.API_URL.rstrip("/")
+        self.api_key = config.API_KEY
         self.retries = retries
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.download_dir = Path(download_dir)
