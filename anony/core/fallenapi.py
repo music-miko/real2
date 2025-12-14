@@ -86,7 +86,7 @@ class V2ApiClient:
         retries: int = 10,                 # ✅ as requested
         timeout: int = 30,
         download_dir: str = "downloads",
-        job_poll_attempts: int = 60,
+        job_poll_attempts: int = 10,
         job_poll_interval: float = 2.0,
         job_poll_backoff: float = 1.2,
         min_valid_size_bytes: int = 1024 * 5,
