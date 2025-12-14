@@ -1,19 +1,3 @@
-# fallenapi.py
-# Stable merged client:
-#   - Video: V2 ONLY
-#   - Audio: V2 first, Fallen (/track) fallback
-# Retries:
-#   - V2: 10 retries
-#   - Fallen: 1 retry
-#
-# Config required:
-#   API_URL,  API_KEY    -> V2 API
-#   API_URL2, API_KEY2   -> Fallen fallback (audio only)
-#
-# Exposes:
-#   client = FallenApi()
-#   await client.download(query, isVideo=False/True)
-
 import asyncio
 import os
 import re
