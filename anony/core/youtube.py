@@ -2,7 +2,6 @@
 # Licensed under the MIT License.
 # This file is part of AnonXMusic
 
-
 import os
 import re
 import yt_dlp
@@ -20,13 +19,17 @@ from anony.helpers import Track, utils
 
 from .fallenapi import FallenApi
 
+
 class YouTube:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
         self.cookies = []
         self.checked = False
         self.warned = False
+
+        # ✅ Updated FallenApi instance (new stable interface)
         self.fallen = FallenApi()
+
         self.regex = re.compile(
             r"(https?://)?(www\.|m\.|music\.)?"
             r"(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
@@ -125,10 +128,19 @@ class YouTube:
 
     async def download(self, video_id: str, video: bool = False) -> Optional[str]:
         url = self.base + video_id
-        if not video and config.API_KEY and config.API_URL:
-            if file_path := await self.fallen.download_track_v2(url):
-                return file_path
-        
+
+        # ✅ PRIMARY path: use V2 API when configured.
+        # - video=True  -> V2 only
+        # - video=False -> V2 first, Fallen fallback (handled inside FallenApi)
+        if config.API_URL and config.API_KEY:
+            try:
+                file_path = await self.fallen.download(url, isVideo=video)
+                if file_path:
+                    return file_path
+            except Exception as e:
+                logger.warning(f"[V2/FALLBACK] API download failed, using yt-dlp fallback: {e}")
+
+        # ✅ yt-dlp fallback (kept same)
         ext = "mp4" if video else "webm"
         filename = f"downloads/{video_id}.{ext}"
 
