@@ -24,8 +24,9 @@ class Config:
         self.SESSION4 = getenv("SESSION4", None)
 
         self.API_KEY = getenv("API_KEY")
-        self.API_URL = getenv("API_URL")
-
+        self.API_URL = getenv("API_URL", "https://api.deadlinetech.site")
+        self.API_URL2 = getenv("API_URL2", "https://tgmusic.fallenapi.fun")  # fallen fallback base url
+        self.API_KEY2 = getenv("API_KEY2")  # fallen fallback key
         
         self.SUPPORT_CHANNEL = getenv("SUPPORT_CHANNEL", "https://t.me/arcupdates")
         self.SUPPORT_CHAT = getenv("SUPPORT_CHAT", "https://t.me/ArcChatz")
