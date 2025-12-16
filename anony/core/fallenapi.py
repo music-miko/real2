@@ -551,7 +551,7 @@ class FallenApi:
         self.v2 = V2ApiClient(
             api_url=getattr(config, "API_URL", None),
             api_key=getattr(config, "API_KEY", None),
-            retries=10,  # ✅ V2=10
+            retries=1,  # ✅ V2=10
             timeout=v2_timeout,
             download_dir=download_dir,
         )
