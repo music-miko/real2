@@ -87,10 +87,10 @@ class V2ApiClient:
         self,
         api_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        retries: int = 10,      # ✅ requested
+        retries: int = 1,      # ✅ requested
         timeout: int = 30,
         download_dir: str = "downloads",
-        job_poll_attempts: int = 10,
+        job_poll_attempts: int = 8,
         job_poll_interval: float = 2.0,
         job_poll_backoff: float = 1.2,
         min_valid_size_bytes: int = 1024 * 5,
