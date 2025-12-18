@@ -1,29 +1,29 @@
+# fallenapi.py — V2 ONLY (audio+video) with 5 retries and forced .mp3/.mp4 filenames
 import asyncio
 import os
 import re
 import uuid
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Dict, Optional, Any
+from urllib.parse import urlparse
 
+import aiofiles
 import aiohttp
-from pydantic import BaseModel
+from aiohttp import TCPConnector
 
+# Project imports (expected in your repo)
 try:
-    from anony import logger, config, app
+    from anony import logger, config, app  # app = pyrogram client
 except Exception:
     import logging as _logging
-    logger = getattr(_logging, "getLogger")("fallenapi")
-    logger.setLevel(_logging.DEBUG)
+    logger = _logging.getLogger("fallenapi")
+    logger.setLevel(_logging.INFO)
     if not logger.handlers:
         logger.addHandler(_logging.StreamHandler())
 
     class _Cfg:
         API_URL = os.environ.get("API_URL", "")
         API_KEY = os.environ.get("API_KEY", "")
-        API_URL2 = os.environ.get("API_URL2", "")
-        API_KEY2 = os.environ.get("API_KEY2", "")
     config = _Cfg()
     app = None
 
@@ -35,23 +35,152 @@ except Exception:
             value = 5
     pyrogram_errors = _PE()
 
+
+# -----------------------
+# STATS (import & use)
+# -----------------------
+DOWNLOAD_STATS: Dict[str, int] = {
+    "total": 0,
+    "success": 0,
+    "failed": 0,
+
+    "success_audio": 0,
+    "success_video": 0,
+    "failed_audio": 0,
+    "failed_video": 0,
+
+    "hard_fail_401": 0,
+    "hard_fail_403": 0,
+    "hard_cycle_retries": 0,
+
+    "api_fail_other_4xx": 0,
+    "api_fail_5xx": 0,
+
+    "network_fail": 0,
+    "timeout_fail": 0,
+
+    "no_candidate": 0,
+    "tg_fail": 0,
+    "cdn_fail": 0,
+}
+
+def get_download_stats() -> Dict[str, int]:
+    return dict(DOWNLOAD_STATS)
+
+def reset_download_stats() -> None:
+    for k in list(DOWNLOAD_STATS.keys()):
+        DOWNLOAD_STATS[k] = 0
+
+def _inc(key: str, n: int = 1) -> None:
+    DOWNLOAD_STATS[key] = DOWNLOAD_STATS.get(key, 0) + n
+
+
+# -----------------------
+# Settings (match downloader.py idea)
+# -----------------------
+V2_HTTP_RETRIES = 5              # network/timeout/5xx retries per request
+V2_DOWNLOAD_CYCLES = 5           # full flow retries for any failure
+HARD_RETRY_WAIT = 3              # wait before retry after 401/403
+
+JOB_POLL_ATTEMPTS = 10
+JOB_POLL_INTERVAL = 2.0
+JOB_POLL_BACKOFF = 1.2
+
+NO_CANDIDATE_WAIT = 4
+
+CDN_RETRIES = 5
+CDN_RETRY_DELAY = 2
+
+CHUNK_SIZE = 1024 * 256  # 256KB
+
+
+# -----------------------
+# Regex / helpers
+# -----------------------
 _YT_ID_RE = re.compile(r"""(?x)(?:v=|\/)([A-Za-z0-9_-]{11})|youtu\.be\/([A-Za-z0-9_-]{11})""")
-_TG_RE = re.compile(r"https?://t\.me/(?:(c)/(\d+)|([^/]+)/(\d+))", re.IGNORECASE)
+_TG_RE = re.compile(r"https?://t\.me/(?:(c)/(\d+)/(\d+)|([^/]+)/(\d+))", re.IGNORECASE)
+
+_session: Optional[aiohttp.ClientSession] = None
+_session_lock = asyncio.Lock()
 
 
-class MusicTrack(BaseModel):
-    cdnurl: Optional[str] = None
-    key: Optional[str] = None
-    name: Optional[str] = None
-    artist: Optional[str] = None
-    tc: Optional[str] = None
+class V2HardAPIError(Exception):
+    def __init__(self, status: int, body_preview: str = ""):
+        super().__init__(f"Hard API error status={status}")
+        self.status = status
+        self.body_preview = body_preview[:200]
+
+
+def extract_video_id(link: str) -> str:
+    if not link:
+        return ""
+    s = link.strip()
+    m = _YT_ID_RE.search(s)
+    if m:
+        return m.group(1) or m.group(2) or ""
+    if "watch?v=" in s:
+        return s.split("watch?v=")[-1].split("&")[0]
+    last = s.split("/")[-1].split("?")[0]
+    return last if len(last) == 11 else ""
+
+
+def _looks_like_status_text(s: Optional[str]) -> bool:
+    if not s:
+        return False
+    low = s.lower()
+    return any(x in low for x in ("download started", "background", "jobstatus", "job_id", "processing", "queued", "check status"))
+
+
+def _extract_candidate(obj: Any) -> Optional[str]:
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        s = obj.strip()
+        return s if s else None
+    if isinstance(obj, list) and obj:
+        return _extract_candidate(obj[0])
+    if isinstance(obj, dict):
+        job = obj.get("job")
+        if isinstance(job, dict):
+            res = job.get("result")
+            if isinstance(res, dict):
+                pub = res.get("public_url")
+                if isinstance(pub, str) and pub.strip():
+                    return pub.strip()
+                for k in ("cdnurl", "download_url", "url", "tg_link", "telegram_link", "message_link", "file_path"):
+                    v = res.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+
+        for k in ("public_url", "cdnurl", "download_url", "url", "tg_link", "telegram_link", "message_link", "file_path"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+        for wrap in ("result", "results", "data", "items", "payload", "message", "tracks"):
+            v = obj.get(wrap)
+            if v:
+                c = _extract_candidate(v)
+                if c:
+                    return c
+    return None
+
+
+def _normalize_candidate_to_url(api_url: str, candidate: str) -> Optional[str]:
+    if not candidate:
+        return None
+    c = candidate.strip()
+    if c.startswith(("http://", "https://")):
+        return c
+    if c.startswith("/"):
+        # ignore local file paths
+        if c.startswith("/root") or c.startswith("/home"):
+            return None
+        return f"{api_url.rstrip('/')}{c}"
+    return f"{api_url.rstrip('/')}/{c.lstrip('/')}"
 
 
 def _as_download_dir(path: Path) -> str:
-    """
-    IMPORTANT: force pyrogram to treat this as DIRECTORY.
-    Some pyrogram versions treat file_name as file path unless it ends with separator.
-    """
     p = str(path.resolve())
     if not p.endswith(os.sep):
         p += os.sep
@@ -59,10 +188,6 @@ def _as_download_dir(path: Path) -> str:
 
 
 def _resolve_if_dir(download_result: str) -> Optional[str]:
-    """
-    Sometimes pyrogram can return a directory-ish path; ensure we return a file.
-    If it's a dir, pick the newest file inside it.
-    """
     if not download_result:
         return None
     p = Path(download_result)
@@ -74,513 +199,345 @@ def _resolve_if_dir(download_result: str) -> Optional[str]:
             return None
         newest = max(files, key=lambda x: x.stat().st_mtime)
         return str(newest)
-    # If it returned something like "/root/real/downloads/downloads" (file path)
-    # and it doesn't exist yet, just return it as-is (caller will treat as failure).
     return download_result
 
 
-# -------------------------
-# V2 API Client (Primary)
-# -------------------------
-class V2ApiClient:
-    def __init__(
-        self,
-        api_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        retries: int = 1,      # ✅ requested
-        timeout: int = 30,
-        download_dir: str = "downloads",
-        job_poll_attempts: int = 8,
-        job_poll_interval: float = 2.0,
-        job_poll_backoff: float = 1.2,
-        min_valid_size_bytes: int = 1024 * 5,
-    ):
-        self.api_url = (api_url or getattr(config, "API_URL", "") or "").rstrip("/")
-        self.api_key = api_key or getattr(config, "API_KEY", "") or ""
-        self.retries = retries
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
+def _force_ext(path: str, forced_ext: str) -> str:
+    """
+    Rename file to forced extension (NO conversion).
+    """
+    if not path:
+        return path
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return path
+
+    forced_ext = forced_ext.lstrip(".")
+    target = p.with_suffix(f".{forced_ext}")
+
+    if str(target) == str(p):
+        return str(p)
+
+    try:
+        # If target already exists, keep target (cache) and remove the new file
+        if target.exists():
+            try:
+                p.unlink(missing_ok=True)  # py3.8+ safe
+            except Exception:
+                pass
+            return str(target)
+
+        p.rename(target)
+        return str(target)
+    except Exception:
+        return str(p)
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global _session
+    if _session and not _session.closed:
+        return _session
+    async with _session_lock:
+        if _session and not _session.closed:
+            return _session
+        timeout = aiohttp.ClientTimeout(total=600, sock_connect=20, sock_read=60)
+        connector = TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
+        _session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        return _session
+
+
+# -----------------------
+# V2-only client
+# -----------------------
+class V2OnlyClient:
+    def __init__(self, download_dir: str = "downloads"):
+        self.api_url = (getattr(config, "API_URL", "") or "").rstrip("/")
+        self.api_key = getattr(config, "API_KEY", "") or ""
+
         self.download_dir = Path(download_dir).resolve()
         self.download_dir.mkdir(parents=True, exist_ok=True)
-        self.job_poll_attempts = job_poll_attempts
-        self.job_poll_interval = job_poll_interval
-        self.job_poll_backoff = job_poll_backoff
-        self.min_valid_size_bytes = min_valid_size_bytes
-        self.ffmpeg_path = shutil.which("ffmpeg")
 
-    def _get_headers(self) -> Dict[str, str]:
-        headers = {"Accept": "application/json"}
+    def _headers(self) -> Dict[str, str]:
+        h = {"Accept": "application/json"}
         if self.api_key:
-            headers["X-API-Key"] = self.api_key
-        return headers
+            h["X-API-Key"] = self.api_key
+        return h
 
-    async def _request_json(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    async def _v2_request_json(self, endpoint: str, params: Dict[str, Any]) -> Optional[Any]:
+        """
+        Retries only on network/timeout/5xx.
+        Raises V2HardAPIError on 401/403 (caller retries by cycle).
+        """
         if not self.api_url:
-            logger.warning("[V2] API_URL not configured.")
             return None
 
-        url = endpoint if endpoint.startswith(("http://", "https://")) else f"{self.api_url}/{endpoint.lstrip('/')}"
+        url = f"{self.api_url}/{endpoint.lstrip('/')}"
         params = dict(params or {})
         if self.api_key and "api_key" not in params:
             params["api_key"] = self.api_key
 
-        last_exc = None
-        for attempt in range(1, self.retries + 1):
-            logger.info("[V2] REQUEST attempt=%s/%s url=%s params=%s", attempt, self.retries, url, params)
+        for attempt in range(1, V2_HTTP_RETRIES + 1):
             try:
-                async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                    async with session.get(url, headers=self._get_headers(), params=params) as resp:
-                        text = await resp.text()
-                        try:
-                            data = await resp.json(content_type=None)
-                        except Exception:
-                            stripped = text.strip()
-                            logger.warning("[V2] Non-JSON response url=%s body=%s", url, stripped[:300])
-                            return stripped
+                session = await get_http_session()
+                async with session.get(url, params=params, headers=self._headers()) as resp:
+                    text = await resp.text()
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        data = None
 
-                        logger.info("[V2] RESPONSE status=%s url=%s", resp.status, url)
-                        if 200 <= resp.status < 300:
-                            return data
-
-                        logger.warning("[V2] API error status=%s data=%s", resp.status, str(data)[:300])
+                    if 200 <= resp.status < 300:
                         return data
 
-            except asyncio.TimeoutError as e:
-                last_exc = e
-                logger.warning("[V2] Timeout attempt=%s/%s url=%s", attempt, self.retries, url)
-            except aiohttp.ClientError as e:
-                last_exc = e
-                logger.warning("[V2] Network error attempt=%s/%s url=%s err=%s", attempt, self.retries, url, e)
-            except Exception as e:
-                last_exc = e
-                logger.exception("[V2] Unexpected error attempt=%s/%s url=%s err=%s", attempt, self.retries, url, e)
+                    if resp.status in (401, 403):
+                        if resp.status == 401:
+                            _inc("hard_fail_401")
+                        else:
+                            _inc("hard_fail_403")
+                        raise V2HardAPIError(resp.status, text)
 
-            await asyncio.sleep(1)
+                    if 500 <= resp.status <= 599:
+                        _inc("api_fail_5xx")
+                        # retry
+                    else:
+                        _inc("api_fail_other_4xx")
+                        return None
 
-        logger.warning("[V2] All retries exhausted url=%s last_err=%s", url, repr(last_exc))
-        return None
+            except V2HardAPIError:
+                raise
+            except asyncio.TimeoutError:
+                _inc("timeout_fail")
+            except aiohttp.ClientError:
+                _inc("network_fail")
+            except Exception:
+                _inc("network_fail")
 
-    async def youtube_v2_download(self, query: str, isVideo: bool = False) -> Optional[Any]:
-        query_to_send = query
-        if isinstance(query, str) and ("youtube." in query or "youtu.be" in query):
-            m = _YT_ID_RE.search(query)
-            if m:
-                vid = m.group(1) or m.group(2)
-                if vid:
-                    query_to_send = vid
-            else:
-                if "watch?v=" in query:
-                    query_to_send = query.split("watch?v=")[-1].split("&")[0]
-                else:
-                    last = query.rstrip("/").split("/")[-1]
-                    if last:
-                        query_to_send = last
-
-        logger.info("[V2] youtube_v2_download normalized=%s isVideo=%s", query_to_send, isVideo)
-        return await self._request_json("youtube/v2/download", params={"query": query_to_send, "isVideo": str(isVideo).lower()})
-
-    async def youtube_v1_download(self, query: str, isVideo: bool = False) -> Optional[Any]:
-        logger.info("[V2] youtube_v1_download compat isVideo=%s", isVideo)
-        return await self._request_json("youtube/v1/download", params={"query": query, "isVideo": str(isVideo).lower()})
-
-    async def youtube_job_status(self, job_id: str) -> Optional[Any]:
-        logger.info("[V2] youtube_job_status job_id=%s", job_id)
-        return await self._request_json("youtube/jobStatus", params={"job_id": job_id})
-
-    def _extract_candidate_from_obj(self, obj: Any) -> Optional[str]:
-        if obj is None:
-            return None
-        if isinstance(obj, str):
-            s = obj.strip()
-            return s if s else None
-        if isinstance(obj, list) and obj:
-            return self._extract_candidate_from_obj(obj[0])
-        if isinstance(obj, dict):
-            if "job" in obj and isinstance(obj["job"], dict):
-                job = obj["job"]
-                res = job.get("result")
-                if isinstance(res, dict):
-                    pub = res.get("public_url")
-                    if isinstance(pub, str) and pub.strip():
-                        return pub.strip()
-                    for k in ("cdnurl", "download_url", "url", "file_path"):
-                        v = res.get(k)
-                        if isinstance(v, str) and v.strip():
-                            return v.strip()
-
-            for k in ("public_url", "cdnurl", "download_url", "url", "file_path", "file", "media", "tg_link", "telegram_link", "message_link"):
-                v = obj.get(k)
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-
-            for wrapper in ("result", "results", "data", "items", "tracks", "payload", "message"):
-                w = obj.get(wrapper)
-                if w:
-                    cand = self._extract_candidate_from_obj(w)
-                    if cand:
-                        return cand
-        return None
-
-    def _looks_like_status_message(self, s: Optional[str]) -> bool:
-        if not s or not isinstance(s, str):
-            return False
-        s_str = s.strip().lower()
-        return any(ind in s_str for ind in (
-            "download started", "background", "jobstatus", "job_id",
-            "processing", "queued", "check status",
-        ))
-
-    def _normalize_candidate_to_url(self, candidate: str) -> Optional[str]:
-        if not candidate:
-            return None
-        c = candidate.strip()
-        if c.startswith(("http://", "https://")):
-            return c
-        if c.startswith("/"):
-            if c.startswith("/root") or c.startswith("/home"):
-                return None
-            return f"{self.api_url.rstrip('/')}{c}"
-        return f"{self.api_url.rstrip('/')}/{c.lstrip('/')}"
-
-    async def _download_cdn_to_file(self, cdn_url: str, preferred_name: Optional[str] = None) -> Optional[str]:
-        logger.info("[V2] CDN download start url=%s preferred=%s", cdn_url, preferred_name)
-        for attempt in range(1, self.retries + 1):
-            try:
-                async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                    async with session.get(cdn_url) as resp:
-                        logger.info("[V2] CDN response status=%s", resp.status)
-                        if resp.status != 200:
-                            return None
-
-                        cd = resp.headers.get("Content-Disposition")
-                        ct = resp.headers.get("Content-Type", "")
-                        filename = preferred_name
-
-                        if not filename and cd:
-                            m = re.findall('filename="?([^";]+)"?', cd)
-                            if m:
-                                filename = m[0]
-
-                        if not filename:
-                            base = os.path.basename(cdn_url.split("?")[0]) or f"{uuid.uuid4().hex[:8]}"
-                            if not os.path.splitext(base)[1]:
-                                if "mp4" in ct.lower():
-                                    base += ".mp4"
-                                else:
-                                    base += ".webm"
-                            filename = base
-
-                        save_path = self.download_dir / filename
-                        logger.info("[V2] Writing file=%s", save_path)
-
-                        with open(save_path, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(16 * 1024):
-                                if chunk:
-                                    f.write(chunk)
-
-                        size = save_path.stat().st_size if save_path.exists() else 0
-                        logger.info("[V2] Saved size=%s path=%s", size, save_path)
-                        if size < self.min_valid_size_bytes:
-                            try:
-                                save_path.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                            return None
-
-                        return str(save_path)
-
-            except Exception as e:
-                logger.warning("[V2] CDN error attempt=%s/%s err=%s", attempt, self.retries, e)
+            if attempt < V2_HTTP_RETRIES:
                 await asyncio.sleep(1)
 
         return None
 
-    async def _download_telegram_media(self, tme_url: str) -> Optional[str]:
-        logger.info("[V2] Telegram download start url=%s", tme_url)
-        if not app:
-            logger.warning("[V2] app is None; cannot download from Telegram.")
-            return None
+    async def _download_from_cdn(self, cdn_url: str, out_path: str) -> Optional[str]:
+        for attempt in range(1, CDN_RETRIES + 1):
+            try:
+                session = await get_http_session()
+                async with session.get(cdn_url) as resp:
+                    if resp.status != 200:
+                        if resp.status in (429, 500, 502, 503, 504) and attempt < CDN_RETRIES:
+                            await asyncio.sleep(CDN_RETRY_DELAY)
+                            continue
+                        return None
 
-        match = _TG_RE.match(tme_url)
-        if match:
-            if match.group(1):
-                channel_id = match.group(2)
-                chat_id = int(f"-100{channel_id}")
-                msg_id = int(tme_url.rstrip("/").split("/")[-1])
-            else:
-                chat_id = match.group(3)
-                msg_id = int(match.group(4))
-        else:
-            parts = tme_url.rstrip("/").split("/")
-            if len(parts) >= 2 and parts[-1].isdigit():
-                chat_id = parts[-2]
-                msg_id = int(parts[-1])
-            else:
-                logger.warning("[V2] Invalid Telegram URL: %s", tme_url)
-                return None
+                    async with aiofiles.open(out_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                            if not chunk:
+                                break
+                            await f.write(chunk)
 
-        try:
-            # ✅ FORCE DIRECTORY DOWNLOAD (fix for downloads.temp issue)
-            dl_dir = _as_download_dir(self.download_dir)
-            logger.info("[V2] msg.download -> dir=%s chat=%s msg=%s", dl_dir, chat_id, msg_id)
-            msg = await app.get_messages(chat_id=chat_id, message_ids=int(msg_id))
-            res = await msg.download(file_name=dl_dir)
+                return out_path if os.path.exists(out_path) else None
 
-            fixed = _resolve_if_dir(res)
-            logger.info("[V2] Telegram download result=%s fixed=%s", res, fixed)
+            except asyncio.TimeoutError:
+                _inc("timeout_fail")
+            except aiohttp.ClientError:
+                _inc("network_fail")
+            except Exception:
+                _inc("network_fail")
 
-            if fixed and Path(fixed).exists():
-                return fixed
-            return None
-
-        except Exception as e:
-            if hasattr(pyrogram_errors, "FloodWait") and isinstance(e, getattr(pyrogram_errors, "FloodWait")):
-                wait = getattr(e, "value", 5)
-                logger.warning("[V2] FloodWait=%ss retrying...", wait)
-                await asyncio.sleep(wait)
-                return await self._download_telegram_media(tme_url)
-            logger.warning("[V2] Telegram download error: %s", e)
-            return None
-
-    async def download_from_v2(self, query: str, isVideo: bool) -> Optional[str]:
-        logger.info("[V2] START download_from_v2 query=%s isVideo=%s", query, isVideo)
-
-        resp = await self.youtube_v2_download(query, isVideo=isVideo)
-        if not resp:
-            logger.warning("[V2] v2 empty -> trying v1 compat")
-            resp = await self.youtube_v1_download(query, isVideo=isVideo)
-
-        if resp is None:
-            logger.warning("[V2] API returned None")
-            return None
-
-        candidate = self._extract_candidate_from_obj(resp)
-        logger.info("[V2] candidate=%s", candidate)
-
-        if candidate and self._looks_like_status_message(candidate):
-            candidate = None
-
-        job_id = None
-        if isinstance(resp, dict):
-            job_id = resp.get("job_id") or resp.get("job")
-            if isinstance(job_id, dict) and "id" in job_id:
-                job_id = job_id.get("id")
-
-        if job_id and not candidate:
-            logger.info("[V2] job_id=%s polling jobStatus", job_id)
-            interval = self.job_poll_interval
-            for i in range(1, self.job_poll_attempts + 1):
-                await asyncio.sleep(interval)
-                logger.info("[V2] jobStatus poll %s/%s", i, self.job_poll_attempts)
-                status = await self.youtube_job_status(str(job_id))
-                candidate = self._extract_candidate_from_obj(status) if status else None
-                if candidate and self._looks_like_status_message(candidate):
-                    candidate = None
-                if candidate:
-                    break
-                interval *= self.job_poll_backoff
-
-        if not candidate:
-            logger.warning("[V2] no candidate after polling")
-            return None
-
-        if candidate.startswith(("http://t.me", "https://t.me")):
-            return await self._download_telegram_media(candidate)
-
-        normalized = self._normalize_candidate_to_url(candidate)
-        logger.info("[V2] normalized=%s", normalized)
-        if not normalized:
-            return None
-
-        preferred_name = None
-        m = _YT_ID_RE.search(query) if isinstance(query, str) else None
-        vid = (m.group(1) or m.group(2)) if m else None
-        if not vid and isinstance(query, str) and "watch?v=" in query:
-            vid = query.split("watch?v=")[-1].split("&")[0]
-        if vid:
-            preferred_name = f"{vid}.mp4" if isVideo else f"{vid}.webm"
-
-        return await self._download_cdn_to_file(normalized, preferred_name=preferred_name)
-
-
-# ----------------------------------------
-# Fallen Track API Client (Audio fallback)
-# ----------------------------------------
-class FallenTrackFallback:
-    def __init__(self, retries: int = 1, timeout: int = 15, download_dir: str = "downloads"):  # ✅ 1 retry
-        self.api_url = (getattr(config, "API_URL2", "") or "").rstrip("/")
-        self.api_key = getattr(config, "API_KEY2", "") or ""
-        self.retries = retries
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
-        self.download_dir = Path(download_dir).resolve()
-        self.download_dir.mkdir(parents=True, exist_ok=True)
-
-    def _get_headers(self) -> Dict[str, str]:
-        headers = {"Accept": "application/json"}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-        return headers
-
-    async def _get_track_obj(self, url: str) -> Optional[dict]:
-        if not self.api_url:
-            logger.warning("[FALLBACK] API_URL2 not configured")
-            return None
-
-        import urllib.parse
-        endpoint = f"{self.api_url}/track?url={urllib.parse.quote(url)}"
-        logger.info("[FALLBACK] REQUEST attempt=1/1 endpoint=%s", endpoint)
-
-        try:
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                async with session.get(endpoint, headers=self._get_headers()) as resp:
-                    data = await resp.json(content_type=None)
-                    logger.info("[FALLBACK] RESPONSE status=%s data=%s", resp.status, str(data)[:300])
-                    if resp.status == 200 and isinstance(data, dict):
-                        return data
-        except Exception as e:
-            logger.warning("[FALLBACK] track request error: %s", e)
+            if attempt < CDN_RETRIES:
+                await asyncio.sleep(CDN_RETRY_DELAY)
 
         return None
 
-    async def _download_telegram_media(self, tme_url: str) -> Optional[str]:
-        logger.info("[FALLBACK] Telegram download start url=%s", tme_url)
+    async def _download_from_telegram(self, tme_url: str) -> Optional[str]:
         if not app:
-            logger.warning("[FALLBACK] app is None; cannot download from Telegram.")
             return None
 
-        match = _TG_RE.match(tme_url)
-        if match:
-            if match.group(1):
-                channel_id = match.group(2)
-                chat_id = int(f"-100{channel_id}")
-                msg_id = int(tme_url.rstrip("/").split("/")[-1])
-            else:
-                chat_id = match.group(3)
-                msg_id = int(match.group(4))
+        m = _TG_RE.match(tme_url)
+        if not m:
+            return None
+
+        if m.group(1):  # /c/<id>/<msg>
+            channel_id = m.group(2)
+            msg_id = int(m.group(3))
+            chat_id = int(f"-100{channel_id}")
         else:
-            parts = tme_url.rstrip("/").split("/")
-            if len(parts) >= 2 and parts[-1].isdigit():
-                chat_id = parts[-2]
-                msg_id = int(parts[-1])
-            else:
-                logger.warning("[FALLBACK] Invalid Telegram URL: %s", tme_url)
-                return None
+            chat_id = m.group(4)
+            msg_id = int(m.group(5))
 
         try:
-            # ✅ FORCE DIRECTORY DOWNLOAD (fix for downloads.temp issue)
             dl_dir = _as_download_dir(self.download_dir)
-            logger.info("[FALLBACK] msg.download -> dir=%s chat=%s msg=%s", dl_dir, chat_id, msg_id)
-            msg = await app.get_messages(chat_id=chat_id, message_ids=int(msg_id))
+            msg = await app.get_messages(chat_id=chat_id, message_ids=msg_id)
             res = await msg.download(file_name=dl_dir)
-
             fixed = _resolve_if_dir(res)
-            logger.info("[FALLBACK] Telegram download result=%s fixed=%s", res, fixed)
-
             if fixed and Path(fixed).exists():
-                logger.info("[FALLBACK] Telegram download complete path=%s", fixed)
                 return fixed
-            logger.warning("[FALLBACK] Telegram returned non-existing path=%s", fixed)
             return None
 
         except Exception as e:
+            # floodwait retry (silent)
             if hasattr(pyrogram_errors, "FloodWait") and isinstance(e, getattr(pyrogram_errors, "FloodWait")):
                 wait = getattr(e, "value", 5)
-                logger.warning("[FALLBACK] FloodWait=%ss retrying...", wait)
                 await asyncio.sleep(wait)
-                return await self._download_telegram_media(tme_url)
-            logger.warning("[FALLBACK] Telegram download error: %s", e)
+                return await self._download_from_telegram(tme_url)
             return None
-
-    async def _download_cdn(self, cdn_url: str) -> Optional[str]:
-        logger.info("[FALLBACK] CDN download start url=%s", cdn_url)
-        try:
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                async with session.get(cdn_url) as resp:
-                    logger.info("[FALLBACK] CDN response status=%s", resp.status)
-                    if resp.status != 200:
-                        return None
-
-                    cd = resp.headers.get("Content-Disposition")
-                    filename = None
-                    if cd:
-                        m = re.findall('filename="?([^";]+)"?', cd)
-                        if m:
-                            filename = m[0]
-                    if not filename:
-                        base = os.path.basename(cdn_url.split("?")[0]) or f"{uuid.uuid4().hex[:8]}.mp3"
-                        if "." not in base:
-                            base += ".mp3"
-                        filename = base
-
-                    save_path = self.download_dir / filename
-                    logger.info("[FALLBACK] Writing file=%s", save_path)
-                    with open(save_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(16 * 1024):
-                            if chunk:
-                                f.write(chunk)
-
-                    logger.info("[FALLBACK] CDN download complete path=%s", save_path)
-                    return str(save_path)
-        except Exception as e:
-            logger.warning("[FALLBACK] CDN download error: %s", e)
-            return None
-
-    async def download_audio(self, url: str) -> Optional[str]:
-        logger.info("[FALLBACK] START download_audio url=%s", url)
-
-        track = await self._get_track_obj(url)
-        if not track:
-            logger.warning("[FALLBACK] no track object")
-            return None
-
-        dl_url = track.get("cdnurl") or track.get("url") or track.get("download_url")
-        if not dl_url or not isinstance(dl_url, str):
-            logger.warning("[FALLBACK] missing dl_url in track=%s", str(track)[:250])
-            return None
-
-        dl_url = dl_url.strip()
-        logger.info("[FALLBACK] resolved_download_url=%s", dl_url)
-
-        if dl_url.startswith(("http://t.me", "https://t.me")):
-            return await self._download_telegram_media(dl_url)
-
-        return await self._download_cdn(dl_url)
-
-
-class FallenApi:
-    def __init__(self, download_dir: str = "downloads", v2_timeout: int = 30, fallen_timeout: int = 15):
-        self.v2 = V2ApiClient(
-            api_url=getattr(config, "API_URL", None),
-            api_key=getattr(config, "API_KEY", None),
-            retries=1,  # ✅ V2=10
-            timeout=v2_timeout,
-            download_dir=download_dir,
-        )
-        self.fallen = FallenTrackFallback(
-            retries=1,   # ✅ Fallen=1
-            timeout=fallen_timeout,
-            download_dir=download_dir,
-        )
 
     async def download(self, query: str, isVideo: bool = False) -> Optional[str]:
-        logger.info("[MAIN] START download query=%s isVideo=%s", query, isVideo)
+        """
+        V2 download with 5 full cycles.
+        Enforces output extension:
+          - video => .mp4
+          - audio => .mp3
+        """
+        forced_ext = "mp4" if isVideo else "mp3"
+        vid = extract_video_id(query)
+        q = vid or query
 
-        if isVideo:
-            logger.info("[MAIN] Video -> V2 ONLY")
-            return await self.v2.download_from_v2(query, isVideo=True)
+        for cycle in range(1, V2_DOWNLOAD_CYCLES + 1):
+            try:
+                resp = await self._v2_request_json(
+                    "youtube/v2/download",
+                    {"query": q, "isVideo": str(bool(isVideo)).lower()},
+                )
+            except V2HardAPIError:
+                _inc("hard_cycle_retries")
+                if cycle < V2_DOWNLOAD_CYCLES:
+                    await asyncio.sleep(HARD_RETRY_WAIT)
+                    continue
+                return None
 
-        logger.info("[MAIN] Audio -> try V2 first")
-        path = await self.v2.download_from_v2(query, isVideo=False)
-        if path:
-            logger.info("[MAIN] Audio downloaded via V2 path=%s", path)
+            if not resp:
+                if cycle < V2_DOWNLOAD_CYCLES:
+                    await asyncio.sleep(1)
+                    continue
+                return None
+
+            candidate = _extract_candidate(resp)
+            if candidate and _looks_like_status_text(candidate):
+                candidate = None
+
+            job_id = None
+            if isinstance(resp, dict):
+                job_id = resp.get("job_id") or resp.get("job")
+                if isinstance(job_id, dict) and "id" in job_id:
+                    job_id = job_id.get("id")
+
+            if job_id and not candidate:
+                interval = JOB_POLL_INTERVAL
+                for _ in range(1, JOB_POLL_ATTEMPTS + 1):
+                    await asyncio.sleep(interval)
+                    try:
+                        status = await self._v2_request_json("youtube/jobStatus", {"job_id": str(job_id)})
+                    except V2HardAPIError:
+                        _inc("hard_cycle_retries")
+                        candidate = None
+                        break
+
+                    candidate = _extract_candidate(status) if status else None
+                    if candidate and _looks_like_status_text(candidate):
+                        candidate = None
+                    if candidate:
+                        break
+                    interval *= JOB_POLL_BACKOFF
+
+            if not candidate:
+                _inc("no_candidate")
+                if cycle < V2_DOWNLOAD_CYCLES:
+                    await asyncio.sleep(NO_CANDIDATE_WAIT)
+                    continue
+                return None
+
+            # Build stable output name
+            base_name = vid if vid else uuid.uuid4().hex[:10]
+            out_path = str(self.download_dir / f"{base_name}.{forced_ext}")
+
+            # Already cached
+            if os.path.exists(out_path):
+                return out_path
+
+            # Telegram candidate
+            if candidate.startswith(("http://t.me", "https://t.me")):
+                raw = await self._download_from_telegram(candidate)
+                if not raw:
+                    _inc("tg_fail")
+                    if cycle < V2_DOWNLOAD_CYCLES:
+                        await asyncio.sleep(2)
+                        continue
+                    return None
+
+                # force extension name (no conversion)
+                final = _force_ext(raw, forced_ext)
+                # also ensure our stable name exists (optional rename)
+                try:
+                    p_final = Path(final)
+                    p_target = Path(out_path)
+                    if p_final.exists() and p_final.is_file() and p_final != p_target:
+                        if not p_target.exists():
+                            p_final.rename(p_target)
+                            return str(p_target)
+                except Exception:
+                    pass
+                return final
+
+            # CDN candidate
+            normalized = _normalize_candidate_to_url(self.api_url, candidate)
+            if not normalized:
+                _inc("no_candidate")
+                if cycle < V2_DOWNLOAD_CYCLES:
+                    await asyncio.sleep(NO_CANDIDATE_WAIT)
+                    continue
+                return None
+
+            # Download to forced extension path directly
+            path = await self._download_from_cdn(normalized, out_path)
+            if not path:
+                _inc("cdn_fail")
+                if cycle < V2_DOWNLOAD_CYCLES:
+                    await asyncio.sleep(2)
+                    continue
+                return None
+
+            # Ensure extension is forced (already is)
+            return _force_ext(path, forced_ext)
+
+        return None
+
+
+# -----------------------
+# Public wrapper (minimal logs)
+# -----------------------
+class FallenApi:
+    """
+    V2 ONLY.
+    Logs only final SUCCESS/FAILED.
+    """
+    def __init__(self, download_dir: str = "downloads"):
+        self.v2 = V2OnlyClient(download_dir=download_dir)
+
+    async def download_audio(self, query: str, title: str = "") -> Optional[str]:
+        _inc("total")
+        path = await self.v2.download(query, isVideo=False)
+        if path and os.path.exists(path):
+            _inc("success"); _inc("success_audio")
+            logger.info("V2_DOWNLOAD_SUCCESS type=audio title='%s' path='%s'", title or "Unknown", path)
             return path
+        _inc("failed"); _inc("failed_audio")
+        logger.warning("V2_DOWNLOAD_FAILED type=audio title='%s' query='%s'", title or "Unknown", query)
+        return None
 
-        logger.warning("[MAIN] V2 audio failed -> trying FALLBACK (final)")
-        fb = await self.fallen.download_audio(query)
-        if fb:
-            logger.info("[MAIN] Audio downloaded via FALLBACK path=%s", fb)
-        else:
-            logger.warning("[MAIN] FALLBACK also failed query=%s", query)
-        return fb
+    async def download_video(self, query: str, title: str = "") -> Optional[str]:
+        _inc("total")
+        path = await self.v2.download(query, isVideo=True)
+        if path and os.path.exists(path):
+            _inc("success"); _inc("success_video")
+            logger.info("V2_DOWNLOAD_SUCCESS type=video title='%s' path='%s'", title or "Unknown", path)
+            return path
+        _inc("failed"); _inc("failed_video")
+        logger.warning("V2_DOWNLOAD_FAILED type=video title='%s' query='%s'", title or "Unknown", query)
+        return None
+
+    async def download(self, query: str, isVideo: bool = False, title: str = "") -> Optional[str]:
+        return await (self.download_video(query, title=title) if isVideo else self.download_audio(query, title=title))
 
 
+# module-level instance (same style as many repos)
 client = FallenApi()
