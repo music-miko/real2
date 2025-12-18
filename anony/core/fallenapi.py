@@ -87,7 +87,7 @@ class V2ApiClient:
         self,
         api_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        retries: int = 1,      # ✅ requested
+        retries: int = 2,      # ✅ requested
         timeout: int = 30,
         download_dir: str = "downloads",
         job_poll_attempts: int = 8,
