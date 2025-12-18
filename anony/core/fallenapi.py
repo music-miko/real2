@@ -1,17 +1,17 @@
-# fallenapi.py — V2 ONLY (audio+video) with 5 retries and forced .mp3/.mp4 filenames
+# fallenapi.py — V2 ONLY (audio+video), downloader.py style
 import asyncio
 import os
 import re
 import uuid
 from pathlib import Path
 from typing import Dict, Optional, Any
-from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
 from aiohttp import TCPConnector
+from urllib.parse import urlparse
 
-# Project imports (expected in your repo)
+# Try your project imports (preferred)
 try:
     from anony import logger, config, app  # app = pyrogram client
 except Exception:
@@ -76,11 +76,11 @@ def _inc(key: str, n: int = 1) -> None:
 
 
 # -----------------------
-# Settings (match downloader.py idea)
+# RETRY SETTINGS (like downloader.py)
 # -----------------------
-V2_HTTP_RETRIES = 5              # network/timeout/5xx retries per request
-V2_DOWNLOAD_CYCLES = 5           # full flow retries for any failure
-HARD_RETRY_WAIT = 3              # wait before retry after 401/403
+V2_HTTP_RETRIES = 5
+V2_DOWNLOAD_CYCLES = 5
+HARD_RETRY_WAIT = 3
 
 JOB_POLL_ATTEMPTS = 10
 JOB_POLL_INTERVAL = 2.0
@@ -95,7 +95,7 @@ CHUNK_SIZE = 1024 * 256  # 256KB
 
 
 # -----------------------
-# Regex / helpers
+# Helpers / Regex
 # -----------------------
 _YT_ID_RE = re.compile(r"""(?x)(?:v=|\/)([A-Za-z0-9_-]{11})|youtu\.be\/([A-Za-z0-9_-]{11})""")
 _TG_RE = re.compile(r"https?://t\.me/(?:(c)/(\d+)/(\d+)|([^/]+)/(\d+))", re.IGNORECASE)
@@ -173,7 +173,7 @@ def _normalize_candidate_to_url(api_url: str, candidate: str) -> Optional[str]:
     if c.startswith(("http://", "https://")):
         return c
     if c.startswith("/"):
-        # ignore local file paths
+        # ignore local filesystem paths
         if c.startswith("/root") or c.startswith("/home"):
             return None
         return f"{api_url.rstrip('/')}{c}"
@@ -202,37 +202,6 @@ def _resolve_if_dir(download_result: str) -> Optional[str]:
     return download_result
 
 
-def _force_ext(path: str, forced_ext: str) -> str:
-    """
-    Rename file to forced extension (NO conversion).
-    """
-    if not path:
-        return path
-    p = Path(path)
-    if not p.exists() or not p.is_file():
-        return path
-
-    forced_ext = forced_ext.lstrip(".")
-    target = p.with_suffix(f".{forced_ext}")
-
-    if str(target) == str(p):
-        return str(p)
-
-    try:
-        # If target already exists, keep target (cache) and remove the new file
-        if target.exists():
-            try:
-                p.unlink(missing_ok=True)  # py3.8+ safe
-            except Exception:
-                pass
-            return str(target)
-
-        p.rename(target)
-        return str(target)
-    except Exception:
-        return str(p)
-
-
 async def get_http_session() -> aiohttp.ClientSession:
     global _session
     if _session and not _session.closed:
@@ -247,9 +216,9 @@ async def get_http_session() -> aiohttp.ClientSession:
 
 
 # -----------------------
-# V2-only client
+# Core V2 downloader (no fallback)
 # -----------------------
-class V2OnlyClient:
+class V2OnlyDownloader:
     def __init__(self, download_dir: str = "downloads"):
         self.api_url = (getattr(config, "API_URL", "") or "").rstrip("/")
         self.api_key = getattr(config, "API_KEY", "") or ""
@@ -264,10 +233,6 @@ class V2OnlyClient:
         return h
 
     async def _v2_request_json(self, endpoint: str, params: Dict[str, Any]) -> Optional[Any]:
-        """
-        Retries only on network/timeout/5xx.
-        Raises V2HardAPIError on 401/403 (caller retries by cycle).
-        """
         if not self.api_url:
             return None
 
@@ -289,6 +254,7 @@ class V2OnlyClient:
                     if 200 <= resp.status < 300:
                         return data
 
+                    # 401/403 -> raise so caller retries by CYCLE
                     if resp.status in (401, 403):
                         if resp.status == 401:
                             _inc("hard_fail_401")
@@ -298,7 +264,7 @@ class V2OnlyClient:
 
                     if 500 <= resp.status <= 599:
                         _inc("api_fail_5xx")
-                        # retry
+                        # retry request
                     else:
                         _inc("api_fail_other_4xx")
                         return None
@@ -366,27 +332,25 @@ class V2OnlyClient:
 
         try:
             dl_dir = _as_download_dir(self.download_dir)
-            msg = await app.get_messages(chat_id=chat_id, message_ids=msg_id)
+            msg = await app.get_messages(chat_id=chat_id, message_ids=int(msg_id))
             res = await msg.download(file_name=dl_dir)
             fixed = _resolve_if_dir(res)
             if fixed and Path(fixed).exists():
                 return fixed
             return None
-
         except Exception as e:
-            # floodwait retry (silent)
             if hasattr(pyrogram_errors, "FloodWait") and isinstance(e, getattr(pyrogram_errors, "FloodWait")):
                 wait = getattr(e, "value", 5)
                 await asyncio.sleep(wait)
                 return await self._download_from_telegram(tme_url)
             return None
 
-    async def download(self, query: str, isVideo: bool = False) -> Optional[str]:
+    async def download(self, query: str, isVideo: bool) -> Optional[str]:
         """
-        V2 download with 5 full cycles.
-        Enforces output extension:
-          - video => .mp4
-          - audio => .mp3
+        V2 download only.
+        - video -> saved as .mp4
+        - audio -> saved as .mp3
+        No conversion. Only naming.
         """
         forced_ext = "mp4" if isVideo else "mp3"
         vid = extract_video_id(query)
@@ -446,39 +410,22 @@ class V2OnlyClient:
                     continue
                 return None
 
-            # Build stable output name
             base_name = vid if vid else uuid.uuid4().hex[:10]
             out_path = str(self.download_dir / f"{base_name}.{forced_ext}")
 
-            # Already cached
+            # cache hit
             if os.path.exists(out_path):
                 return out_path
 
-            # Telegram candidate
             if candidate.startswith(("http://t.me", "https://t.me")):
-                raw = await self._download_from_telegram(candidate)
-                if not raw:
+                path = await self._download_from_telegram(candidate)
+                if not path:
                     _inc("tg_fail")
                     if cycle < V2_DOWNLOAD_CYCLES:
                         await asyncio.sleep(2)
                         continue
-                    return None
+                return path
 
-                # force extension name (no conversion)
-                final = _force_ext(raw, forced_ext)
-                # also ensure our stable name exists (optional rename)
-                try:
-                    p_final = Path(final)
-                    p_target = Path(out_path)
-                    if p_final.exists() and p_final.is_file() and p_final != p_target:
-                        if not p_target.exists():
-                            p_final.rename(p_target)
-                            return str(p_target)
-                except Exception:
-                    pass
-                return final
-
-            # CDN candidate
             normalized = _normalize_candidate_to_url(self.api_url, candidate)
             if not normalized:
                 _inc("no_candidate")
@@ -487,7 +434,6 @@ class V2OnlyClient:
                     continue
                 return None
 
-            # Download to forced extension path directly
             path = await self._download_from_cdn(normalized, out_path)
             if not path:
                 _inc("cdn_fail")
@@ -496,48 +442,40 @@ class V2OnlyClient:
                     continue
                 return None
 
-            # Ensure extension is forced (already is)
-            return _force_ext(path, forced_ext)
+            return path
 
         return None
 
 
 # -----------------------
-# Public wrapper (minimal logs)
+# Public wrapper (2 logs only)
 # -----------------------
-class FallenApi:
-    """
-    V2 ONLY.
-    Logs only final SUCCESS/FAILED.
-    """
+class V2Api:
     def __init__(self, download_dir: str = "downloads"):
-        self.v2 = V2OnlyClient(download_dir=download_dir)
-
-    async def download_audio(self, query: str, title: str = "") -> Optional[str]:
-        _inc("total")
-        path = await self.v2.download(query, isVideo=False)
-        if path and os.path.exists(path):
-            _inc("success"); _inc("success_audio")
-            logger.info("V2_DOWNLOAD_SUCCESS type=audio title='%s' path='%s'", title or "Unknown", path)
-            return path
-        _inc("failed"); _inc("failed_audio")
-        logger.warning("V2_DOWNLOAD_FAILED type=audio title='%s' query='%s'", title or "Unknown", query)
-        return None
-
-    async def download_video(self, query: str, title: str = "") -> Optional[str]:
-        _inc("total")
-        path = await self.v2.download(query, isVideo=True)
-        if path and os.path.exists(path):
-            _inc("success"); _inc("success_video")
-            logger.info("V2_DOWNLOAD_SUCCESS type=video title='%s' path='%s'", title or "Unknown", path)
-            return path
-        _inc("failed"); _inc("failed_video")
-        logger.warning("V2_DOWNLOAD_FAILED type=video title='%s' query='%s'", title or "Unknown", query)
-        return None
+        self.v2 = V2OnlyDownloader(download_dir=download_dir)
 
     async def download(self, query: str, isVideo: bool = False, title: str = "") -> Optional[str]:
-        return await (self.download_video(query, title=title) if isVideo else self.download_audio(query, title=title))
+        _inc("total")
+        kind = "video" if isVideo else "audio"
+
+        path = await self.v2.download(query, isVideo=isVideo)
+        if path and os.path.exists(path):
+            _inc("success")
+            if isVideo:
+                _inc("success_video")
+            else:
+                _inc("success_audio")
+            logger.info("V2_DOWNLOAD_SUCCESS type=%s title='%s' path='%s'", kind, title or "Unknown", path)
+            return path
+
+        _inc("failed")
+        if isVideo:
+            _inc("failed_video")
+        else:
+            _inc("failed_audio")
+        logger.warning("V2_DOWNLOAD_FAILED type=%s title='%s' query='%s'", kind, title or "Unknown", query)
+        return None
 
 
-# module-level instance (same style as many repos)
-client = FallenApi()
+# module-level instance (same usage style as before)
+client = V2Api(download_dir="downloads")
