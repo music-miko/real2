@@ -2,19 +2,13 @@
 # Licensed under the MIT License.
 # This file is part of AnonXMusic
 
-import os
 import re
-import yt_dlp
-import random
-import asyncio
-import aiohttp
-from pathlib import Path
 from typing import Optional, Union
 
 from pyrogram import enums, types
 from py_yt import Playlist, VideosSearch
 
-from anony import logger, config
+from anony import logger
 from anony.helpers import Track, utils
 
 from .fallenapi import FallenApi
@@ -23,12 +17,9 @@ from .fallenapi import FallenApi
 class YouTube:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
-        self.cookies = []
-        self.checked = False
-        self.warned = False
 
-        # ✅ Updated FallenApi instance (new stable interface)
-        self.fallen = FallenApi()
+        # ✅ V2-only downloader (downloads will be stored in old downloads/ folder)
+        self.fallen = FallenApi(download_dir="downloads")
 
         self.regex = re.compile(
             r"(https?://)?(www\.|m\.|music\.)?"
@@ -36,62 +27,55 @@ class YouTube:
             r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
         )
 
-    def get_cookies(self):
-        if not self.checked:
-            for file in os.listdir("anony/cookies"):
-                if file.endswith(".txt"):
-                    self.cookies.append(file)
-            self.checked = True
-        if not self.cookies:
-            if not self.warned:
-                self.warned = True
-                logger.warning("Cookies are missing; downloads might fail.")
-            return None
-        return f"anony/cookies/{random.choice(self.cookies)}"
-
-    async def save_cookies(self, urls: list[str]) -> None:
-        logger.info("Saving cookies from urls...")
-        for url in urls:
-            path = f"anony/cookies/cookie{random.randint(10000, 99999)}.txt"
-            link = url.replace("me/", "me/raw/")
-            async with aiohttp.ClientSession() as session:
-                async with session.get(link) as resp:
-                    with open(path, "wb") as fw:
-                        fw.write(await resp.read())
-        logger.info("Cookies saved.")
-
     def valid(self, url: str) -> bool:
         return bool(re.match(self.regex, url))
 
     def url(self, message_1: types.Message) -> Union[str, None]:
         messages = [message_1]
         link = None
+
         if message_1.reply_to_message:
             messages.append(message_1.reply_to_message)
 
         for message in messages:
-            text = message.text or message.caption or ""
-
+            # text entities
             if message.entities:
                 for entity in message.entities:
                     if entity.type == enums.MessageEntityType.URL:
-                        link = text[entity.offset : entity.offset + entity.length]
-                        break
-
-            if message.caption_entities:
-                for entity in message.caption_entities:
+                        try:
+                            link = message.text[entity.offset : entity.offset + entity.length]
+                            break
+                        except Exception:
+                            continue
                     if entity.type == enums.MessageEntityType.TEXT_LINK:
                         link = entity.url
                         break
 
+            # caption entities
+            if not link and message.caption_entities:
+                for entity in message.caption_entities:
+                    if entity.type == enums.MessageEntityType.URL:
+                        try:
+                            link = message.caption[entity.offset : entity.offset + entity.length]
+                            break
+                        except Exception:
+                            continue
+                    if entity.type == enums.MessageEntityType.TEXT_LINK:
+                        link = entity.url
+                        break
+
+            if link:
+                break
+
         if link:
+            # remove extra tracking params like &si / ?si
             return link.split("&si")[0].split("?si")[0]
         return None
 
     async def search(self, query: str, m_id: int, video: bool = False) -> Track | None:
         _search = VideosSearch(query, limit=1)
         results = await _search.next()
-        if results and results["result"]:
+        if results and results.get("result"):
             data = results["result"][0]
             return Track(
                 id=data.get("id"),
@@ -99,8 +83,8 @@ class YouTube:
                 duration=data.get("duration"),
                 duration_sec=utils.to_seconds(data.get("duration")),
                 message_id=m_id,
-                title=data.get("title")[:25],
-                thumbnail=data.get("thumbnails", [{}])[-1].get("url").split("?")[0],
+                title=(data.get("title") or "")[:25],
+                thumbnail=(data.get("thumbnails", [{}])[-1].get("url") or "").split("?")[0],
                 url=data.get("link"),
                 view_count=data.get("viewCount", {}).get("short"),
                 video=video,
@@ -109,16 +93,16 @@ class YouTube:
 
     async def playlist(self, limit: int, user: str, url: str, video: bool) -> list[Track]:
         plist = await Playlist.get(url)
-        tracks = []
-        for data in plist["videos"][:limit]:
+        tracks: list[Track] = []
+        for data in plist.get("videos", [])[:limit]:
             track = Track(
                 id=data.get("id"),
                 channel_name=data.get("channel", {}).get("name", ""),
                 duration=data.get("duration"),
                 duration_sec=utils.to_seconds(data.get("duration")),
-                title=data.get("title")[:25],
-                thumbnail=data.get("thumbnails")[-1].get("url").split("?")[0],
-                url=data.get("link").split("&list=")[0],
+                title=(data.get("title") or "")[:25],
+                thumbnail=(data.get("thumbnails") or [{}])[-1].get("url", "").split("?")[0],
+                url=(data.get("link") or "").split("&list=")[0],
                 user=user,
                 view_count="",
                 video=video,
@@ -127,61 +111,22 @@ class YouTube:
         return tracks
 
     async def download(self, video_id: str, video: bool = False) -> Optional[str]:
+        """
+        ✅ V2 ONLY download (no yt-dlp, no cookies, no proxies here)
+        - video=False -> audio (.mp3)
+        - video=True  -> video (.mp4)
+        - stored in downloads/ folder (old path)
+        """
         url = self.base + video_id
 
-        # ✅ PRIMARY path: use V2 API when configured.
-        # - video=True  -> V2 only
-        # - video=False -> V2 first, Fallen fallback (handled inside FallenApi)
-        if config.API_URL and config.API_KEY:
-            try:
-                file_path = await self.fallen.download(url, isVideo=video)
-                if file_path:
-                    return file_path
-            except Exception as e:
-                logger.warning(f"[V2/FALLBACK] API download failed, using yt-dlp fallback: {e}")
-
-        # ✅ yt-dlp fallback (kept same)
-        ext = "mp4" if video else "webm"
-        filename = f"downloads/{video_id}.{ext}"
-
-        if Path(filename).exists():
-            return filename
-
-        cookie = self.get_cookies()
-        base_opts = {
-            "outtmpl": "downloads/%(id)s.%(ext)s",
-            "quiet": True,
-            "noplaylist": True,
-            "geo_bypass": True,
-            "no_warnings": True,
-            "overwrites": False,
-            "nocheckcertificate": True,
-            "cookiefile": cookie,
-        }
-
-        if video:
-            ydl_opts = {
-                **base_opts,
-                "format": "(bestvideo[height<=?720][width<=?1280][ext=mp4])+(bestaudio)",
-                "merge_output_format": "mp4",
-            }
-        else:
-            ydl_opts = {
-                **base_opts,
-                "format": "bestaudio[ext=webm][acodec=opus]",
-            }
-
-        def _download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                try:
-                    ydl.download([url])
-                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
-                    if cookie in self.cookies:
-                        self.cookies.remove(cookie)
-                    return None
-                except Exception as ex:
-                    logger.error("Download failed: %s", ex)
-                    return None
-            return filename
-
-        return await asyncio.to_thread(_download)
+        try:
+            file_path = await self.fallen.download(url, isVideo=video, title=video_id)
+            return file_path
+        except Exception as e:
+            logger.warning(
+                "V2_DOWNLOAD_FAILED type=%s id=%s err=%s",
+                "video" if video else "audio",
+                video_id,
+                e,
+            )
+            return None
