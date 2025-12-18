@@ -17,7 +17,7 @@ from py_yt import Playlist, VideosSearch
 from anony import logger, config
 from anony.helpers import Track, utils
 
-from .fallenapi import FallenApi
+from .fallenapi import client as FallenApi
 
 
 class YouTube:
